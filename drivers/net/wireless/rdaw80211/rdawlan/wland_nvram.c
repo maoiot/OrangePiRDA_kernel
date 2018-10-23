@@ -1,6 +1,7 @@
 
 /*
  * Copyright (c) 2014 Rdamicro Corporation
+ * Modified 2018 by Alexey Maslyukov <mao50mao@gmail.com>
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
