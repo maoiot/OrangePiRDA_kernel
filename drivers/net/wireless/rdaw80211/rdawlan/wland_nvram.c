@@ -15,6 +15,7 @@
  * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+#include <linux/ctype.h>
 #include <linux/fs.h>
 #include <asm/uaccess.h>
 
@@ -28,6 +29,115 @@
 #endif
 
 #define WIFI_NVRAM_FILE_NAME    "/data/misc/wifi/WLANMAC"
+#define WIFI_BOOT_FILE_NAME		"/boot/network/WLANMAC"
+
+char *atohx(char *dst, const char *src)
+{
+	char *ret = dst;
+	int lsb;
+	int msb;
+	for(; *src; src += 2){
+		msb = tolower(*src);
+		lsb = tolower(*(src+1));
+		msb -= isdigit(msb) ? 0x30 : 0x57;
+		lsb -= isdigit(lsb) ? 0x30 : 0x57;
+		if((msb < 0x0 || msb > 0xf) || (lsb < 0x0 || lsb > 0xf)){
+			*ret = 0;
+			return NULL;
+		}
+		*dst++ = (char)(lsb | (msb << 4));
+	}
+	*dst = 0;
+	return ret;
+}
+
+static int boot_read(char *filename, char *buf, ssize_t len, int offset)
+{
+        struct file *fd;
+        int retLen = -1;
+	long l;
+	char mac[13];
+	loff_t pos = offset;
+
+        mm_segment_t old_fs = get_fs();
+
+        set_fs( get_ds() );
+	WLAND_DBG(DEFAULT, ERROR,"[boot_read]: openning file %s...\n", filename);
+
+        fd = filp_open(filename, O_RDONLY, 0);
+
+        if (IS_ERR(fd)) {
+                WLAND_ERR("[boot_read]: failed to open!\n");
+                retLen = -EINVAL;
+		goto fail_open;
+        }
+	l = vfs_llseek( fd, 0L, 2 );
+	if( l <= 0 ) {
+        	WLAND_DBG(DEFAULT, ERROR, "[boot_read]: failed to lseek %s\n", filename );
+        	retLen = -EINVAL;
+        	goto failure;
+    	}
+	WLAND_DBG(DEFAULT, ERROR, "[boot_read]: file size = %d bytes\n", (int)l );
+	if( l < sizeof(mac)-1 ){
+                WLAND_ERR("[boot_read]: mac size less 12 chars\n");
+                retLen = -EINVAL;
+                goto failure;
+
+	}
+	vfs_llseek( fd, 0L, 0 );
+ 	if( ( retLen = vfs_read( fd, (void __force __user *)mac, sizeof(mac)-1, &pos ) ) != sizeof(mac)-1 ) {
+		WLAND_ERR( "[boot_read]: failed to read\n" );
+		retLen = -EINVAL;
+		goto failure;
+	}
+	mac[sizeof(mac)-1] = '\0';
+	if( !atohx(buf,mac) ) {
+		WLAND_ERR( "[boot_read]: convert mac from WLANMAC error\n" );
+		retLen = -EINVAL;
+		goto failure;
+        }
+	WLAND_DBG(DEFAULT, ERROR,
+                "[boot_read]: /boot/network/WLANMAC -> [%02x:%02x:%02x:%02x:%02x:%02x].\n",
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+failure:
+        filp_close(fd,NULL);
+fail_open:
+        set_fs(old_fs);
+
+        return retLen;
+}
+static int boot_write(char *filename, char *buf, ssize_t len, int offset)
+{
+        struct file *fd;
+        int retLen = -1;
+        char mac[13];
+        loff_t pos = offset;
+
+        mm_segment_t old_fs = get_fs();
+        set_fs( get_ds() );
+        WLAND_DBG(DEFAULT, ERROR,"[boot_write]: create file %s...\n", filename);
+
+        fd = filp_open(filename, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
+
+        if (IS_ERR(fd)) {
+                WLAND_ERR("[boot_write]: failed to create file!\n");
+                retLen = -ENOENT;
+                goto fail_create;
+        }
+	snprintf(mac, 13, "%02X%02X%02X%02X%02X%02X", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]); 
+	if( ( retLen = vfs_write( fd, mac, strlen( mac ), &pos ) ) != strlen( mac ) ) {
+		WLAND_ERR( "[boot_write]: failed to write\n" );
+                retLen = -EIO;
+                goto failure;
+	}
+	WLAND_DBG(DEFAULT, ERROR,"[boot_write]: mac %s -> %s\n", mac, filename);
+failure:
+        filp_close(fd,NULL);
+fail_create:
+        set_fs(old_fs);
+
+        return retLen;
+}
 
 static int nvram_read(char *filename, char *buf, ssize_t len, int offset)
 {
@@ -92,6 +202,7 @@ static int nvram_write(char *filename, char *buf, ssize_t len, int offset)
 
 		if (fd->f_pos != offset) {
 			if (fd->f_op->llseek) {
+
 				if (fd->f_op->llseek(fd, offset, 0) != offset) {
 					WLAND_ERR("[nvram_write] : failed to seek!\n");
 					break;
@@ -177,7 +288,15 @@ int wlan_read_mac_from_nvram(char *buf)
 		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
 	ret = 0;		/* success */
 
-err_invalid_mac:
+err_invalid_mac: 
+	if( ret != 0 ){
+		ret = boot_read(WIFI_BOOT_FILE_NAME, buf, 6, 0);
+		WLAND_DBG(DEFAULT, ERROR,
+                	"nvram: get boot wifi mac address [%02x:%02x:%02x:%02x:%02x:%02x].\n",
+                	buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+	//if(ret < 0) ret = -EINVAL;
+		if( ret > 0 ) ret = 0;
+	}
 err_handle_cmd:
 	rda_msys_unregister_device(wlan_msys);
 	rda_msys_free_device(wlan_msys);
@@ -231,6 +350,8 @@ err_handle_cmd:
 	rda_msys_unregister_device(wlan_msys);
 	rda_msys_free_device(wlan_msys);
 err_handle_sys:
+	ret = boot_write(WIFI_BOOT_FILE_NAME, buf, 6, 0);
+	if (ret > 0) ret = 0;
 	return ret;
 }
 #endif
